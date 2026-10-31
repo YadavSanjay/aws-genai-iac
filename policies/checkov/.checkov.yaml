@@ -1,0 +1,8 @@
+# Checkov policy-as-code config. Tune skips deliberately and comment why.
+framework:
+  - terraform
+  - terraform_plan
+quiet: true
+compact: true
+skip-check: []
+# soft-fail: true   # uncomment to warn-only during early bootstrap

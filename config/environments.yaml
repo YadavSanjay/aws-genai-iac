@@ -1,0 +1,21 @@
+# Logical environments in the single AWS account.
+# Non-secret config only. Secrets → SSM Parameter Store / Secrets Manager.
+# Real account id is NOT stored here — keep it in a gitignored override
+# (config/account.local.yaml) or the IAC_AWS_ACCOUNT_ID env var.
+account_id: "000000000000"   # placeholder — real id lives in a gitignored override
+region: us-east-1
+
+environments:
+  dev:
+    name_prefix: genai-dev
+    vpc_cidr: 10.10.0.0/16
+  staging:
+    name_prefix: genai-stg
+    vpc_cidr: 10.20.0.0/16
+  prod:
+    name_prefix: genai-prod
+    vpc_cidr: 10.30.0.0/16
+
+tags:
+  Project: aws-genai-iac
+  Owner: platform-team

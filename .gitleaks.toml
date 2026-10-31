@@ -1,0 +1,15 @@
+# Default gitleaks rules, plus one narrow exception.
+#
+# The app env-file mappings in infra/ pair a secret's JSON key with the env var that
+# receives it, as in `password = "DB_PASSWORD"`. The value is a variable NAME, read at
+# runtime from Secrets Manager, but it matches hashicorp-tf-password. The exception covers
+# only upper-case names ending in _PASSWORD, so a literal password is still reported.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "hashicorp-tf-password"
+
+[[rules.allowlists]]
+description = "Env var names in secret-to-env mappings, not values"
+regexes = ['''^"[A-Z][A-Z0-9_]*_PASSWORD"$''']

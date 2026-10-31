@@ -1,0 +1,27 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      python:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Provider floors only. Any change here is an infrastructure change: read the plan first.
+  - package-ecosystem: terraform
+    directories:
+      - /infra/modules/**
+    schedule:
+      interval: weekly
+    groups:
+      terraform:
+        patterns: ["*"]

@@ -1,0 +1,47 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(./**)",
+      "Bash(task ci)",
+      "Bash(task lint)",
+      "Bash(task test)",
+      "Bash(task policy)",
+      "Bash(terragrunt hcl fmt *)",
+      "Bash(terraform fmt *)",
+      "Bash(terraform validate *)",
+      "Bash(pytest *)",
+      "Bash(ruff *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell|mcp__aws-mcp__aws___call_aws",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$CLAUDE_PROJECT_DIR/scripts/aws_admin_guard.py\""
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|NotebookEdit|MultiEdit|Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$CLAUDE_PROJECT_DIR/scripts/protected_paths_guard.py\""
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$CLAUDE_PROJECT_DIR/scripts/shell_tool_guard.py\""
+          }
+        ]
+      }      
+    ]
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "aws-mcp": {
+      "command": "uvx",
+      "args": [
+        "mcp-proxy-for-aws==1.6.3",
+        "https://aws-mcp.us-east-1.api.aws/mcp",
+        "--region", "us-east-1",
+        "--metadata", "AWS_REGION=us-east-1"
+      ],
+      "env": {
+        "AWS_PROFILE": "readonlyagent"
+      }
+    }
+  }
+}

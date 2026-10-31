@@ -1,0 +1,100 @@
+# Runs on a clean checkout, so nothing here can lean on the gitignored local files
+# (.mcp.json, infra/account.local.hcl, .public-denylist). No AWS credentials are used:
+# the live post-apply tests in tests/integration are excluded by the pytest config.
+#
+# Actions are pinned to commit SHAs (version in the trailing comment); Dependabot proposes
+# upgrades. Tools are pinned too, and the gitleaks download is checked against its digest.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install -e ".[dev,ui,diagrams]"
+
+      - name: Ruff
+        run: |
+          ruff check src tests scripts
+          ruff format --check src tests scripts
+
+      - name: Mypy
+        run: |
+          mypy
+          mypy scripts --ignore-missing-imports
+
+      - name: Pytest
+        run: pytest
+
+      - name: Public-safety check
+        run: python scripts/check_public_safe.py
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      - name: Format
+        run: terraform -chdir=infra fmt -check -recursive
+
+  policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install checkov
+        run: pip install checkov==3.2.457
+
+      # Reports one parsing error: checkov's HCL parser rejects the multi-line ternary in
+      # infra/modules/data/rds/outputs.tf. That file holds outputs only, so no resource goes unchecked.
+      - name: Checkov
+        run: checkov -d infra --config-file policies/checkov/.checkov.yaml
+
+  secrets:
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # the scan covers full history, not only the latest commit
+
+      - name: Install gitleaks
+        run: |
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$archive"
+          echo "$GITLEAKS_SHA256  $RUNNER_TEMP/$archive" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
+
+      - name: Scan history
+        run: '"$RUNNER_TEMP/gitleaks" git --redact --no-banner --log-opts="--all" .'

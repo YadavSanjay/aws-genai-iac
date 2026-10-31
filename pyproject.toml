@@ -1,0 +1,81 @@
+[project]
+name = "aws-genai-iac"
+version = "0.1.0"
+description = "IaC control plane for AWS GenAI workloads: provisioning, deployment, monitoring, costing"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "typer>=0.12",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "boto3>=1.34",
+    "rich>=13.7",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+ui = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+]
+dev = [
+    "pytest>=8.2",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "boto3-stubs[essential]>=1.34",
+    "moto>=5.0",
+    "pre-commit>=3.7",
+    # NOTE: checkov is deliberately NOT listed here. It pins networkx<3, which
+    # downgrades the shared py312 env and breaks scikit-image for other projects.
+    # `task policy` runs it through `uvx` in an isolated, pinned environment.
+]
+diagrams = [
+    # AWS-icon architecture diagrams (scripts/gen_diagrams.py). ALSO needs the
+    # Graphviz `dot` binary on PATH — not a pip package, install separately:
+    #   conda install -n py312 -c conda-forge graphviz
+    "diagrams>=0.24",
+    "python-hcl2>=7",  # parse terragrunt.hcl to auto-derive the overall view
+]
+
+[project.scripts]
+iac = "iac.cli.main:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/iac"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["iac"]
+
+# The `diagrams` library ships no type information (used only by the diagram
+# generator + its icon registry). Treat it as untyped rather than erroring.
+[[tool.mypy.overrides]]
+module = ["diagrams.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+# Integration tests hit the LIVE AWS API and need a pinned AWS_PROFILE, so they
+# are excluded from the default run (and therefore from `task ci`). Run them
+# explicitly after an apply: `task verify`. They are real checks, not mocks —
+# a skipped integration test means UNVERIFIED, never "passing".
+addopts = "-ra -q -m 'not integration'"
+markers = [
+    "integration: post-apply verification against live AWS (requires AWS_PROFILE=genai-tf)",
+]

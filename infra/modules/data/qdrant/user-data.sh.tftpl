@@ -1,0 +1,128 @@
+#!/bin/bash
+# Qdrant host bootstrap.
+#
+# cloud-init runs on FIRST BOOT ONLY, and this host is stopped/started daily, so
+# anything that must happen every boot is a systemd unit (docker, the fstab mount
+# and qdrant.service), never a one-shot command here. First boot writes the
+# durable artifacts (formatted+labelled data volume, TLS cert, env-file, unit)
+# onto the persistent root/data volumes; every boot the units bring the store up.
+#
+# TEMPLATING NOTE: this file is rendered by Terraform's templatefile(). Terraform
+# substitutions are written dollar-brace (see the region/image/port tokens); every
+# BASH construct uses a single '$' ($VAR, $(...), $2), which Terraform passes
+# through untouched. Never double a bash dollar sign: Terraform only escapes a
+# doubled dollar-brace, so a doubled dollar before a name or '(' renders literally
+# and breaks bash. That was this bootstrap's original bug.
+#
+# Config is by QDRANT__SECTION__KEY environment variables (highest precedence,
+# always read) via a root-only env-file, not a mounted YAML whose loading depends
+# on RUN_MODE. TLS is always on. The API key is enforced only when a secret is
+# wired; otherwise the host comes up AUTH-OFF (a documented, time-bounded dev
+# bring-up relaxation — see the module README).
+set -euxo pipefail
+
+REGION="${region}"
+SECRET_ID="${secret_id}"
+REQUIRE_API_KEY="${require_api_key}"
+IMAGE="${image}"
+REGISTRY="${registry}"
+
+dnf update -y
+dnf install -y docker openssl unzip jq
+systemctl enable --now docker
+
+# AWS CLI v2 (arm64) — needed for the ECR login (and the secret read when auth is
+# enabled). AL2023 usually ships it; install only if missing. No subshell / line
+# continuation here: both are easy to break under templating.
+if ! command -v aws >/dev/null 2>&1; then
+  curl -fsSL --retry 5 --retry-delay 5 --connect-timeout 10 "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o /tmp/awscliv2.zip
+  unzip -q /tmp/awscliv2.zip -d /tmp
+  /tmp/aws/install
+fi
+
+# --- Data volume: format once (labelled), mount by label every boot ----------
+# The data volume is the non-root disk. Find it via the root disk's parent kernel
+# name, format+label once, then mount by LABEL so NVMe device renaming across a
+# stop/start cannot break the mount.
+if ! blkid -L qdrant-data >/dev/null 2>&1; then
+  ROOT_DISK=$(lsblk -no PKNAME "$(findmnt -no SOURCE /)")
+  DATA_DISK=""
+  for i in $(seq 1 30); do
+    DATA_DISK=$(lsblk -dpno NAME,TYPE | awk '$2=="disk"{print $1}' | grep -Fv "/dev/$ROOT_DISK" | head -1)
+    [ -n "$DATA_DISK" ] && break
+    sleep 2
+  done
+  [ -n "$DATA_DISK" ] || { echo "FATAL: data volume not found" >&2; exit 1; }
+  mkfs.xfs -L qdrant-data "$DATA_DISK"
+fi
+mkdir -p /var/lib/qdrant
+grep -q 'LABEL=qdrant-data' /etc/fstab || echo 'LABEL=qdrant-data /var/lib/qdrant xfs defaults,nofail 0 2' >> /etc/fstab
+mount -a
+mkdir -p /var/lib/qdrant/storage /var/lib/qdrant/snapshots
+
+# --- Self-signed TLS (dev; internal, private-subnet only) --------------------
+install -d -m 0755 /etc/qdrant/tls
+if [ ! -f /etc/qdrant/tls/cert.pem ]; then
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout /etc/qdrant/tls/key.pem -out /etc/qdrant/tls/cert.pem -subj "/CN=${cert_cn}" -addext "subjectAltName=DNS:${cert_cn}"
+  chmod 0644 /etc/qdrant/tls/cert.pem
+  chmod 0600 /etc/qdrant/tls/key.pem
+fi
+
+# --- Config env-file (600). Non-secret settings + TLS, always on. ------------
+umask 077
+cat > /etc/qdrant/qdrant.env <<EOF
+QDRANT__SERVICE__HOST=0.0.0.0
+QDRANT__SERVICE__HTTP_PORT=${rest_port}
+QDRANT__SERVICE__GRPC_PORT=${grpc_port}
+QDRANT__SERVICE__ENABLE_TLS=true
+QDRANT__TLS__CERT=/qdrant/tls/cert.pem
+QDRANT__TLS__KEY=/qdrant/tls/key.pem
+QDRANT__STORAGE__STORAGE_PATH=/qdrant/storage
+QDRANT__STORAGE__SNAPSHOTS_PATH=/qdrant/snapshots
+EOF
+
+# --- API key: enforced only when a secret is wired ---------------------------
+# Tracing OFF around the secret so it never reaches the cloud-init log.
+if [ "$REQUIRE_API_KEY" = "true" ]; then
+  set +x
+  API_KEY=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET_ID" --query SecretString --output text | jq -r .api_key)
+  if [ -z "$API_KEY" ] || [ "$API_KEY" = "null" ]; then
+    echo "FATAL: secret wired but no api_key present in $SECRET_ID" >&2
+    exit 1
+  fi
+  printf 'QDRANT__SERVICE__API_KEY=%s\n' "$API_KEY" >> /etc/qdrant/qdrant.env
+  unset API_KEY
+  set -x
+else
+  echo "WARNING: Qdrant starting with API-key auth DISABLED (dev bring-up). Ingress is still private + SG-restricted. Close by wiring secret_arn." | tee /var/log/qdrant-authoff-warning
+fi
+umask 022
+
+# --- Pull the mirrored image (first boot; persists on the root volume) --------
+aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+docker pull "$IMAGE"
+
+# --- systemd unit: static; the 600 env-file carries all config ----------------
+cat > /etc/systemd/system/qdrant.service <<EOF
+[Unit]
+Description=Qdrant vector store
+After=docker.service network-online.target var-lib-qdrant.mount
+Requires=docker.service
+RequiresMountsFor=/var/lib/qdrant
+
+[Service]
+Restart=always
+RestartSec=5
+ExecStartPre=-/usr/bin/docker rm -f qdrant
+ExecStart=/usr/bin/docker run --rm --name qdrant -p ${rest_port}:${rest_port} -p ${grpc_port}:${grpc_port} --env-file /etc/qdrant/qdrant.env -v /var/lib/qdrant/storage:/qdrant/storage -v /var/lib/qdrant/snapshots:/qdrant/snapshots -v /etc/qdrant/tls:/qdrant/tls:ro ${image}
+ExecStop=/usr/bin/docker stop qdrant
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now qdrant.service
+
+# Marker for post-apply verification: proves cloud-init reached the end rather
+# than dying partway (which looks identical to a slow boot).
+echo "bootstrap-complete $(date -Is) qdrant ${image} apikey=$REQUIRE_API_KEY" >/var/log/qdrant-bootstrap-status

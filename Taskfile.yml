@@ -1,0 +1,122 @@
+# Taskfile — single entrypoint for common workflows. https://taskfile.dev
+version: "3"
+
+vars:
+  ENV: '{{.ENV | default "dev"}}'
+  # Wrapper for Python tooling so tasks run inside the py312 env without a manual
+  # `conda activate`. Override on machines/CI where the tools are already on PATH:
+  #   task ci PY=            (empty -> run bare commands)
+  PY: '{{.PY | default "conda run --no-capture-output -n py312"}}'
+
+tasks:
+  default:
+    cmds: [task --list]
+    silent: true
+
+  install:
+    desc: Install the CLI and dev tooling
+    cmds:
+      - '{{.PY}} pip install -e ".[dev,ui]"'
+      - '{{.PY}} pre-commit install'
+
+  lint:
+    desc: Lint Python (ruff) and format-check Terraform
+    cmds:
+      # `scripts` is included deliberately: the PreToolUse agent guards live there
+      # and are security-critical. Keep this list in sync with .pre-commit-config.yaml,
+      # whose ruff hooks are unscoped and therefore already cover scripts/.
+      - '{{.PY}} ruff check src tests scripts'
+      - '{{.PY}} ruff format --check src tests scripts'
+      - terraform -chdir=infra fmt -check -recursive
+      - '{{.PY}} python scripts/check_public_safe.py'
+
+  typecheck:
+    desc: Static type check
+    # mypy's pyproject config targets the `iac` package; the guard scripts are not
+    # part of it, so they are named explicitly rather than silently skipped.
+    cmds:
+      - '{{.PY}} mypy'
+      - '{{.PY}} mypy scripts --ignore-missing-imports'
+
+  test:
+    desc: Run Python unit tests
+    cmds: ['{{.PY}} pytest']
+
+  verify:
+    desc: "Post-apply verification against LIVE AWS (AWS_PROFILE=genai-tf). Run after every apply."
+    preconditions:
+      # A silent skip here would read as success. Refuse to run without an identity.
+      - sh: |
+          case "$(aws sts get-caller-identity --query Arn --output text 2>/dev/null)" in
+            *:assumed-role/genai-terraform-exec/*) ;;
+            *) exit 1 ;;
+          esac
+        msg: "Refusing: post-apply verification must run as the exec role. Set AWS_PROFILE=genai-tf (check with `task whoami`)."
+    cmds: ['{{.PY}} pytest tests/integration -m integration -v']
+
+  policy:
+    desc: Run policy-as-code checks against Terraform modules
+    # Run via uvx, NOT the py312 env: checkov pins networkx<3, which downgrades
+    # the shared env and breaks scikit-image for other projects on this machine.
+    # Override CHECKOV= on a machine where it is already on PATH.
+    vars:
+      CHECKOV: '{{.CHECKOV | default "uvx --from checkov==3.2.457 checkov"}}'
+    cmds:
+      - '{{.CHECKOV}} -d infra --config-file policies/checkov/.checkov.yaml'
+
+  whoami:
+    desc: "Show which AWS identity Terraform will use (set AWS_PROFILE=genai-tf to run as the exec role)"
+    cmds:
+      - aws sts get-caller-identity
+      - cmd: |
+          case "$(aws sts get-caller-identity --query Arn --output text 2>/dev/null)" in
+            *:assumed-role/genai-terraform-exec/*) echo "OK: running as genai-terraform-exec — ready for plan/apply." ;;
+            "") echo "NOTE: no AWS identity resolved. For plan/apply set AWS_PROFILE=genai-tf." ;;
+            *) echo "NOTE: not the exec role. For plan/apply set AWS_PROFILE=genai-tf; iam-baseline needs your admin identity." ;;
+          esac
+        silent: true
+
+  iam-baseline:
+    desc: "One-time: apply the global IAM baseline (exec role + tfuser + boundary). Run as your ADMIN identity."
+    dir: infra/environments/global/iam-baseline
+    preconditions:
+      # Must NOT be the exec role: it cannot create/modify itself (guardrail denies it).
+      - sh: |
+          case "$(aws sts get-caller-identity --query Arn --output text 2>/dev/null)" in
+            *:assumed-role/genai-terraform-exec/*) exit 1 ;;
+          esac
+        msg: "Refusing: you are the exec role. iam-baseline must run as an ADMIN identity — unset AWS_PROFILE=genai-tf (use your admin profile). Check with `task whoami`."
+    cmds: [terragrunt apply]
+
+  plan:
+    desc: "Terragrunt plan for an environment (ENV=dev|staging|prod). Run with AWS_PROFILE=genai-tf to assume the exec role."
+    preconditions:
+      - sh: |
+          case "$(aws sts get-caller-identity --query Arn --output text 2>/dev/null)" in
+            *:assumed-role/genai-terraform-exec/*) ;;
+            *) exit 1 ;;
+          esac
+        msg: "Refusing: not running as genai-terraform-exec. Set AWS_PROFILE=genai-tf (tfuser -> exec role) first. Check with `task whoami`."
+    cmds: ["terragrunt run --all --working-dir infra/environments/{{.ENV}} -- plan"]
+
+  apply:
+    desc: "Terragrunt apply for an environment (ENV=dev|staging|prod). Run with AWS_PROFILE=genai-tf to assume the exec role."
+    preconditions:
+      - sh: |
+          case "$(aws sts get-caller-identity --query Arn --output text 2>/dev/null)" in
+            *:assumed-role/genai-terraform-exec/*) ;;
+            *) exit 1 ;;
+          esac
+        msg: "Refusing: not running as genai-terraform-exec. Set AWS_PROFILE=genai-tf (tfuser -> exec role) first. Check with `task whoami`."
+    cmds: ["terragrunt run --all --working-dir infra/environments/{{.ENV}} -- apply"]
+
+  ui:
+    desc: Run the operator dashboard backend
+    cmds: ['{{.PY}} uvicorn iac_ui.app:app --reload --app-dir ui/backend']
+
+  ci:
+    desc: Full local gate (lint + typecheck + test). Run `task policy` separately before an apply.
+    cmds:
+      - task: lint
+      - task: typecheck
+      - task: test

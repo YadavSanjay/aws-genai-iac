@@ -1,0 +1,191 @@
+#!/bin/bash
+# Generic compose-application host bootstrap (rendered by Terraform templatefile).
+#
+# TEMPLATING NOTE: Terraform substitutions are dollar-brace (${region} etc.);
+# every BASH variable uses a SINGLE '$' ($VAR, $(...)) which Terraform passes
+# through untouched. NEVER double a bash dollar sign — Terraform only un-escapes
+# a doubled dollar-brace ($${), so a doubled '$' before a name or '(' renders
+# literally and breaks bash at first boot. Guarded by tests/unit/
+# test_bootstrap_script_syntax.py (bash -n on the raw template).
+#
+# cloud-init runs ONCE, on first boot: it installs docker + the aws cli + the
+# compose plugin, mounts the data volume via fstab, writes /opt/app/.env (the
+# non-secret project env), and writes app-deploy.sh plus a systemd unit that
+# runs it. app.service then runs on EVERY boot — this host is stopped/started
+# daily, and a one-shot compose-up would work day one and silently do nothing
+# day two (the same trap the NAT iptables rules and the qdrant unit avoid).
+set -euxo pipefail
+
+REGION="${region}"
+REGISTRY="${registry}"
+BUNDLE_URI="${bundle_uri}"
+COMPOSE_FILE="${compose_file}"
+DATA_MOUNT="${data_mount}"
+SECRET_ARN="${secret_arn}"
+SECRET_ENV_FILE="${secret_env_file}"
+
+# Optional per-deploy env-file inside the bundle (image tags). Compose --env-file
+# arg is computed here so app-deploy.sh carries a baked value, not a template token.
+DEPLOY_ENV_FILE=""
+DEPLOY_ENV_ARG=""
+DEPLOY_ENV_S3=""
+if [ -n "${deploy_env_relpath}" ]; then
+  DEPLOY_ENV_FILE="/opt/app/bundle/${deploy_env_relpath}"
+  DEPLOY_ENV_ARG="--env-file $DEPLOY_ENV_FILE"
+  DEPLOY_ENV_S3="$BUNDLE_URI/${deploy_env_relpath}"
+fi
+
+# Optional JSON DB secret (e.g. an RDS-managed master-user secret). Its fields are
+# APPENDED as DB_* lines to the app env-file (secret_env_file) per boot, so the
+# compose service reads them through the same env_file: it already uses for the
+# verbatim secret — no second --env-file, so the compose command is untouched.
+# Fetched per boot, so a rotated password is picked up on a plain service restart:
+# no image rebuild, no reprovision.
+DB_SECRET_ARN="${db_secret_arn}"
+
+dnf update -y
+dnf install -y docker unzip
+systemctl enable --now docker
+
+# Compose v2 as a Docker CLI plugin (arm64, matching Graviton). Not in the
+# AL2023 repos, so fetched directly. Deliberately NON-FATAL: this is the only
+# step depending on the public internet, so it is the only one that can fail for
+# reasons unrelated to this host (a GitHub outage, or the NAT being down).
+COMPOSE_VERSION="v2.29.7"
+install -d -m 0755 /usr/local/lib/docker/cli-plugins
+if curl -fsSL --retry 3 --retry-delay 5 --connect-timeout 10 "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-linux-aarch64" -o /usr/local/lib/docker/cli-plugins/docker-compose; then
+  chmod 0755 /usr/local/lib/docker/cli-plugins/docker-compose
+else
+  rm -f /usr/local/lib/docker/cli-plugins/docker-compose
+fi
+usermod -aG docker ec2-user
+
+# AWS CLI v2 (arm64) — needed for the s3 sync, the ECR login and the secret
+# read. AL2023 usually ships it; install only if missing.
+if ! command -v aws >/dev/null 2>&1; then
+  curl -fsSL --retry 5 --retry-delay 5 --connect-timeout 10 "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o /tmp/awscliv2.zip
+  unzip -q /tmp/awscliv2.zip -d /tmp
+  /tmp/aws/install
+fi
+
+# --- Data volume: format once (labelled), mount by label every boot ----------
+# Find the non-root disk, format+label it once, then mount by LABEL so an NVMe
+# device rename across a stop/start cannot break the mount. Only when a data
+# volume was requested (DATA_MOUNT non-empty).
+if [ -n "$DATA_MOUNT" ]; then
+  if ! blkid -L appdata >/dev/null 2>&1; then
+    ROOT_DISK=$(lsblk -no PKNAME "$(findmnt -no SOURCE /)")
+    DATA_DISK=""
+    for i in $(seq 1 30); do
+      DATA_DISK=$(lsblk -dpno NAME,TYPE | awk '$2=="disk"{print $1}' | grep -Fv "/dev/$ROOT_DISK" | head -1)
+      [ -n "$DATA_DISK" ] && break
+      sleep 2
+    done
+    [ -n "$DATA_DISK" ] || { echo "FATAL: data volume not found" >&2; exit 1; }
+    mkfs.xfs -L appdata "$DATA_DISK"
+  fi
+  mkdir -p "$DATA_MOUNT"
+  grep -q 'LABEL=appdata' /etc/fstab || echo "LABEL=appdata $DATA_MOUNT xfs defaults,nofail 0 2" >> /etc/fstab
+  mount -a
+fi
+
+# --- Non-secret project env, for compose interpolation (--env-file) -----------
+# Image URIs, service endpoints and the corpus bucket — everything the compose
+# file interpolates that is NOT a credential. The secret env-file is separate,
+# rendered per-boot by app-deploy.sh below.
+install -d -m 0755 /opt/app
+cat > /opt/app/.env <<'PROJECT_ENV_EOF'
+${project_env}
+PROJECT_ENV_EOF
+
+# The app secret renders to app_env_file_path, which may sit outside /opt/app
+# (e.g. /opt/macrorag/.env to match a compose env_file: default). Create its
+# parent directory here, or the per-boot redirect fails before the stack starts.
+if [ -n "$SECRET_ENV_FILE" ]; then
+  install -d -m 0755 "$(dirname "$SECRET_ENV_FILE")"
+fi
+
+# --- app-deploy.sh: the per-boot deploy, baked with this host's config --------
+# Written with an UNQUOTED heredoc so the outer $VARs expand into literal values
+# here; the file then carries no template dependency. It runs every boot.
+cat > /usr/local/bin/app-deploy.sh <<DEPLOY_EOF
+#!/bin/bash
+set -euo pipefail
+
+# Nothing to deploy on a host with no bundle (docker-only consumers).
+[ -n "$BUNDLE_URI" ] || exit 0
+
+# Sync the deploy bundle (compose file + configs) from S3. Rides the free S3
+# gateway endpoint — no NAT dependency for this pull.
+mkdir -p /opt/app/bundle
+aws s3 sync "$BUNDLE_URI" /opt/app/bundle --delete
+
+# Render the app secret VERBATIM to its env-file (600). The secret is stored as
+# compose env_file lines (KEY=value), so it is written as-is, never parsed. No
+# 'set -x' in this script, so the value never reaches a log.
+if [ -n "$SECRET_ARN" ]; then
+  umask 077
+  aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET_ARN" --query SecretString --output text > "$SECRET_ENV_FILE"
+  umask 022
+fi
+
+# Append the JSON DB secret's fields to the app env-file (600) under the env-var
+# names in db_secret_env_map (JSON key -> env name), so the container reads them
+# straight from its env_file: — no compose interpolation, no per-app mapping. The
+# consumer picks the names its code expects (e.g. username -> XBRL_DB_USER).
+# python3 ships on AL2023; no 'set -x' here, so the password never reaches a log.
+# Re-run every boot, so a rotated password is picked up on a restart with no
+# rebuild or reprovision.
+if [ -n "$DB_SECRET_ARN" ] && [ -n "$SECRET_ENV_FILE" ]; then
+  umask 077
+  aws secretsmanager get-secret-value --region "$REGION" --secret-id "$DB_SECRET_ARN" --query SecretString --output text \
+    | python3 -c 'import json,sys
+mapping = ${db_secret_env_map_json}
+d = json.load(sys.stdin)
+sys.stdout.write("".join(f"{env}={d[key]}\n" for key,env in mapping.items() if key in d))' >> "$SECRET_ENV_FILE"
+  umask 022
+fi
+
+# The per-deploy env-file (image tags) rides in the bundle. Fetch it with `cp`,
+# NOT via the `s3 sync` above: a tag swap between two same-length git SHAs does
+# not change the file SIZE, and `s3 sync` skips same-size files — so a redeploy
+# would silently keep the old tag. `cp` always overwrites. Fall back to an empty
+# file (so the compose --env-file never errors) if there is no object.
+if [ -n "$DEPLOY_ENV_S3" ]; then
+  aws s3 cp "$DEPLOY_ENV_S3" "$DEPLOY_ENV_FILE" || : > "$DEPLOY_ENV_FILE"
+fi
+
+# ECR login, then pull + (re)start the stack. Pulls are in-region ECR, so they
+# ride the S3 gateway endpoint too. The bundle deploy.env is the SECOND
+# --env-file so its image tags override any placeholder in /opt/app/.env.
+aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+docker compose --env-file /opt/app/.env $DEPLOY_ENV_ARG -f "/opt/app/bundle/$COMPOSE_FILE" pull
+docker compose --env-file /opt/app/.env $DEPLOY_ENV_ARG -f "/opt/app/bundle/$COMPOSE_FILE" up -d --remove-orphans
+DEPLOY_EOF
+chmod 0755 /usr/local/bin/app-deploy.sh
+
+# --- systemd unit: runs app-deploy.sh on every boot --------------------------
+MOUNT_REQ=""
+if [ -n "$DATA_MOUNT" ]; then MOUNT_REQ="RequiresMountsFor=$DATA_MOUNT"; fi
+cat > /etc/systemd/system/app.service <<UNIT_EOF
+[Unit]
+Description=Compose application stack
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+$MOUNT_REQ
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/app-deploy.sh
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+systemctl daemon-reload
+systemctl enable --now app.service
+
+# Marker for post-apply verification: proves cloud-init reached the end rather
+# than dying partway (which looks identical to a slow boot).
+echo "bootstrap-complete $(date -Is) bundle=$BUNDLE_URI" >/var/log/app-bootstrap-status

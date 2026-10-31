@@ -1,0 +1,11 @@
+# Normalize line endings: store as LF in the repo, check out native on Windows.
+* text=auto
+
+# Files that MUST stay LF regardless of platform (executable scripts, etc.)
+*.sh    text eol=lf
+*.hcl   text eol=lf
+*.tf    text eol=lf
+# Bootstrap TEMPLATES too: templatefile() renders these into EC2 user_data, and a
+# CRLF checkout on Windows would put \r into the rendered bash and break it at
+# boot. (e.g. user-data.sh.tftpl)
+*.tftpl text eol=lf

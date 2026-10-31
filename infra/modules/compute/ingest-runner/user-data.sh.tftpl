@@ -1,0 +1,163 @@
+#!/bin/bash
+# ARag ingest runner bootstrap (rendered by Terraform templatefile).
+#
+# TEMPLATING NOTE: Terraform substitutions are dollar-brace (${region} etc.); every
+# BASH variable is a SINGLE '$' which Terraform passes through. Never double a bash
+# '$' before a name or '(' — Terraform only un-escapes '$${'. Guarded by
+# tests/unit/test_bootstrap_script_syntax.py (bash -n on the raw template).
+#
+# NOT a service. cloud-init installs docker + the aws cli, writes the env-files,
+# pre-pulls the ingest image, and writes an `arag-ingest` wrapper. An operator then
+# connects via SSM and runs the pipeline, e.g.:
+#   sudo arag-ingest python scripts/bootstrap_db.py --phase data --ticker NVDA
+# cloud-init runs ONCE on first boot; the image + env-files persist on the root
+# volume across the stop/start cycle this on-demand box lives in.
+#
+# THE IMAGE TAG IS NOT BAKED HERE. It lives in an S3 pointer object
+# (image_pointer_uri) that `arag-resolve-image` reads at RUN time, mirroring the
+# app tier's deploy.env. user-data feeds the instance's user_data, which carries
+# user_data_replace_on_change — so baking a tag here would mean every image bump
+# REPLACES the box. It did, until this was fixed; the tag drifted five commits
+# behind the code and the runbook failed with a bare "No such file or directory".
+# Bump an image by re-running scripts/deploy_arag_ingest_image.py. No Terraform,
+# no reprovision.
+set -euxo pipefail
+
+REGION="${region}"
+REGISTRY="${registry}"
+IMAGE_POINTER_URI="${image_pointer_uri}"
+SECRET_ARN="${secret_arn}"
+SECRET_ENV_FILE="${secret_env_file}"
+DB_SECRET_ARN="${db_secret_arn}"
+
+dnf update -y
+dnf install -y docker unzip
+systemctl enable --now docker
+usermod -aG docker ec2-user
+
+# AWS CLI v2 (arm64). AL2023 usually ships it; install only if missing.
+if ! command -v aws >/dev/null 2>&1; then
+  curl -fsSL --retry 5 --retry-delay 5 --connect-timeout 10 "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o /tmp/awscliv2.zip
+  unzip -q /tmp/awscliv2.zip -d /tmp
+  /tmp/aws/install
+fi
+
+# --- Non-secret runtime env (endpoints, deploy mode, bucket) ------------------
+install -d -m 0755 /opt/app
+cat > /opt/app/.env <<'PROJECT_ENV_EOF'
+${project_env}
+PROJECT_ENV_EOF
+
+if [ -n "$SECRET_ENV_FILE" ]; then
+  install -d -m 0755 "$(dirname "$SECRET_ENV_FILE")"
+fi
+install -d -m 1777 /var/lib/arag-scratch
+
+# --- Secret renderer, baked with this host's config --------------------------
+# Written with an UNQUOTED heredoc so the outer $VARs expand into literal values;
+# the script then carries no template dependency. Its own `set` has no -x, so the
+# secret values never reach a log. Re-run before every ingest so a rotated DB
+# password is picked up without a rebuild or reprovision. The app secret renders
+# verbatim (KEY=value lines); the DB secret's fields append under the names in
+# db_secret_env_map (e.g. username -> XBRL_DB_USER).
+cat > /usr/local/bin/arag-render-secrets <<RENDER_EOF
+#!/bin/bash
+set -euo pipefail
+if [ -n "$SECRET_ARN" ]; then
+  umask 077
+  aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET_ARN" --query SecretString --output text > "$SECRET_ENV_FILE"
+  umask 022
+fi
+if [ -n "$DB_SECRET_ARN" ] && [ -n "$SECRET_ENV_FILE" ]; then
+  umask 077
+  aws secretsmanager get-secret-value --region "$REGION" --secret-id "$DB_SECRET_ARN" --query SecretString --output text \
+    | python3 -c 'import json,sys
+mapping = ${db_secret_env_map_json}
+d = json.load(sys.stdin)
+sys.stdout.write("".join(f"{env}={d[key]}\n" for key,env in mapping.items() if key in d))' >> "$SECRET_ENV_FILE"
+  umask 022
+fi
+RENDER_EOF
+chmod 0755 /usr/local/bin/arag-render-secrets
+
+# --- Baked host config -------------------------------------------------------
+# The ONLY values user-data hands the runtime scripts. Deliberately no image tag:
+# everything here is account/host-level and changes only when the box is meant to
+# be replaced anyway. Written with an UNQUOTED heredoc so the outer $VARs expand
+# into literal values; the scripts below then source it and carry no template
+# dependency, which lets them use QUOTED heredocs (see the note below).
+install -d -m 0755 /opt/arag
+cat > /opt/arag/runner.conf <<CONF_EOF
+REGION="$REGION"
+REGISTRY="$REGISTRY"
+IMAGE_POINTER_URI="$IMAGE_POINTER_URI"
+SECRET_ENV_FILE="$SECRET_ENV_FILE"
+CONF_EOF
+chmod 0644 /opt/arag/runner.conf
+
+# --- Image resolver ----------------------------------------------------------
+# Prints the image URI to run, read fresh from the S3 pointer on every call.
+#
+# QUOTED heredoc ('RESOLVE_EOF'): every $VAR below is meant for BASH at run time,
+# not for the boot-time shell, so nothing may expand here. That also keeps this
+# body free of dollar-brace, which templatefile would otherwise try to substitute.
+#
+# `cp`, never `s3 sync` — two git-SHA tags are the same LENGTH, so a bump does not
+# change the object's size and sync would silently skip it, leaving the old image
+# running. Same trap the app tier documents in ec2-app/user-data.sh.tftpl.
+cat > /usr/local/bin/arag-resolve-image <<'RESOLVE_EOF'
+#!/bin/bash
+set -euo pipefail
+. /opt/arag/runner.conf
+ARAG_INGEST_IMAGE=""
+if aws s3 cp "$IMAGE_POINTER_URI" /opt/arag/ingest.env >/dev/null 2>&1; then
+  . /opt/arag/ingest.env
+fi
+if [ -z "$ARAG_INGEST_IMAGE" ]; then
+  echo "ERROR: no ARAG_INGEST_IMAGE published at $IMAGE_POINTER_URI" >&2
+  echo "Publish one from the IaC repo, then re-run:" >&2
+  echo "  AWS_PROFILE=genai-tf python scripts/deploy_arag_ingest_image.py --tag arm64-<sha>" >&2
+  exit 1
+fi
+printf '%s\n' "$ARAG_INGEST_IMAGE"
+RESOLVE_EOF
+chmod 0755 /usr/local/bin/arag-resolve-image
+
+# --- Run wrapper -------------------------------------------------------------
+# `arag-ingest <args>` re-renders secrets, resolves the CURRENT image, logs in to
+# ECR and runs the pipeline with both env-files + a scratch mount. Quoted heredoc
+# for the same reason as the resolver, which also makes "$@" a literal (it is the
+# operator's args, expanded at run time) without needing a backslash escape.
+cat > /usr/local/bin/arag-ingest <<'WRAP_EOF'
+#!/bin/bash
+set -euo pipefail
+. /opt/arag/runner.conf
+/usr/local/bin/arag-render-secrets
+IMG="$(/usr/local/bin/arag-resolve-image)"
+aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$REGISTRY" >/dev/null
+docker run --rm --env-file /opt/app/.env --env-file "$SECRET_ENV_FILE" \
+  -v /var/lib/arag-scratch:/tmp/arag "$IMG" "$@"
+WRAP_EOF
+chmod 0755 /usr/local/bin/arag-ingest
+
+# --- Render once + pre-pull so the box is ready to ingest --------------------
+# DELIBERATELY NON-FATAL (the trailing `|| true`), unlike everything above it.
+# This block depends on state outside the instance — the pointer object existing,
+# the image being pushed, ECR reachable. Under `set -e` a failure here aborts
+# cloud-init BEFORE the status marker, producing a box that looks provisioned
+# (wrapper present, env-files written) but has no image and no marker to say so.
+# That exact failure cost a debugging session. The pre-pull is a warm cache, not
+# a correctness requirement: arag-ingest resolves and pulls on demand anyway, and
+# it fails loudly with an actionable message when the pointer is missing.
+/usr/local/bin/arag-render-secrets
+
+PREPULLED="none"
+if IMG="$(/usr/local/bin/arag-resolve-image 2>/dev/null)"; then
+  if aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$REGISTRY" && docker pull "$IMG"; then
+    PREPULLED="$IMG"
+  fi
+fi || true
+
+# Always written, whatever the pre-pull did — a marker that is absent on failure
+# cannot distinguish "still booting" from "died an hour ago".
+echo "ingest-runner-ready $(date -Is) pointer=$IMAGE_POINTER_URI prepulled=$PREPULLED" >/var/log/ingest-runner-status

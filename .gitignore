@@ -1,0 +1,74 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# ---- Terraform / Terragrunt ----
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars.local
+override.tf
+override.tf.json
+*_override.tf
+.terragrunt-cache/
+.terraform.lock.hcl
+
+# ---- Secrets / local env ----
+.env
+.env.*
+*.pem
+*.key
+secrets.*.yaml
+
+# ---- Local account/config overrides (REAL values — never committed) ----
+# e.g. infra/account.local.hcl (real AWS account id), config/*.local.yaml
+*.local.hcl
+config/*.local.yaml
+
+# ---- Node / frontend ----
+node_modules/
+ui/frontend/dist/
+ui/frontend/.vite/
+
+# ---- Claude Code local harness (kept local, not shared) ----
+# Ignore the contents, NOT the directory — a negation cannot re-include a file
+# whose parent directory is excluded, so this must be `.claude/*`.
+.claude/*
+
+# ...except the hook wiring. scripts/*_guard.py are committed, but a guard only
+# takes effect once registered as a PreToolUse hook here. Without this file a
+# fresh clone gets every guard script and its tests but ZERO enforcement —
+# protection that looks present and isn't. No secrets live in it.
+!.claude/settings.json
+
+# ---- Personal MCP server config (machine-specific paths — not shared) ----
+.mcp.json
+
+# ---- Machine-specific agent notes (local paths, the admin profile name) ----
+CLAUDE.local.md
+.public-denylist
+docs/local/
+
+# ---- OS / IDE ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Generated architecture diagrams: PNGs are committed (self-contained); SVGs
+# embed absolute local icon paths and are NOT portable yet (see
+# docs/diagrams/README.md roadmap — inline base64 to make them committable).
+docs/diagrams/**/*.svg
