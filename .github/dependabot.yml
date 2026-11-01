@@ -17,9 +17,31 @@ updates:
         patterns: ["*"]
 
   # Provider floors only. Any change here is an infrastructure change: read the plan first.
+  # Listed by hand because `/infra/modules/**` stops at the category folders, which hold no
+  # .tf files, and fails the update. tests/unit/test_dependabot_modules.py keeps this complete.
   - package-ecosystem: terraform
     directories:
-      - /infra/modules/**
+      - /infra/modules/compute/ec2-app
+      - /infra/modules/compute/ecs-service
+      - /infra/modules/compute/ingest-runner
+      - /infra/modules/cost/budgets
+      - /infra/modules/data/qdrant
+      - /infra/modules/data/rds
+      - /infra/modules/data/s3
+      - /infra/modules/edge/alb
+      - /infra/modules/networking/dns
+      - /infra/modules/networking/endpoints
+      - /infra/modules/networking/nat-instance
+      - /infra/modules/networking/security-groups
+      - /infra/modules/networking/subnets
+      - /infra/modules/networking/vpc
+      - /infra/modules/observability/alerts
+      - /infra/modules/observability/scheduler-alarms
+      - /infra/modules/registry/ecr
+      - /infra/modules/scheduler/eventbridge
+      - /infra/modules/security/iam-terraform-role
+      - /infra/modules/security/kms
+      - /infra/modules/security/secrets
     schedule:
       interval: weekly
     groups:
